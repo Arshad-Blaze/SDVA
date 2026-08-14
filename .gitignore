@@ -1,0 +1,7 @@
+# Python caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Runtime data (default workspace: raw/, datasets/, config store, reports/)
+dva/data/
