@@ -44,6 +44,7 @@ class FileStatus(str, Enum):
 
     # ---- failure ----------------------------------------------------
     DOWNLOAD_FAILED = "DOWNLOAD_FAILED"
+    DECOMPRESSION_FAILED = "DECOMPRESSION_FAILED"
     DETECTION_FAILED = "DETECTION_FAILED"
     PARSE_FAILED = "PARSE_FAILED"
     WRITE_FAILED = "WRITE_FAILED"
@@ -56,6 +57,7 @@ class FileStatus(str, Enum):
     FAILURE_STATES: frozenset["FileStatus"] = frozenset(
         {
             DOWNLOAD_FAILED,
+            DECOMPRESSION_FAILED,
             DETECTION_FAILED,
             PARSE_FAILED,
             WRITE_FAILED,
@@ -93,6 +95,7 @@ _TRANSITIONS: dict[FileStatus, frozenset[FileStatus]] = {
             FileStatus.AWAITING_APPROVAL,
             FileStatus.PARSING,
             FileStatus.DETECTION_FAILED,
+            FileStatus.DECOMPRESSION_FAILED,
         }
     ),
     # Approval can be accepted, modified, or reprocessed (re-detect).
@@ -100,7 +103,11 @@ _TRANSITIONS: dict[FileStatus, frozenset[FileStatus]] = {
         {FileStatus.PARSING, FileStatus.DETECTING, FileStatus.DETECTION_FAILED}
     ),
     FileStatus.PARSING: frozenset(
-        {FileStatus.PARQUET_WRITING, FileStatus.PARSE_FAILED}
+        {
+            FileStatus.PARQUET_WRITING,
+            FileStatus.PARSE_FAILED,
+            FileStatus.DECOMPRESSION_FAILED,
+        }
     ),
     FileStatus.PARQUET_WRITING: frozenset(
         {FileStatus.DATASET_VERIFYING, FileStatus.WRITE_FAILED}
@@ -114,10 +121,11 @@ _TRANSITIONS: dict[FileStatus, frozenset[FileStatus]] = {
     ),
     # Failure states only move forward via explicit retry.
     FileStatus.DOWNLOAD_FAILED: frozenset({FileStatus.DOWNLOAD_QUEUED}),
-    FileStatus.PARSE_FAILED: frozenset({FileStatus.PARSING}),
-    FileStatus.DETECTION_FAILED: frozenset({FileStatus.DETECTING}),
-    FileStatus.WRITE_FAILED: frozenset({FileStatus.PARQUET_WRITING}),
-    FileStatus.VERIFICATION_FAILED: frozenset({FileStatus.DATASET_VERIFYING}),
+    FileStatus.DECOMPRESSION_FAILED: frozenset({FileStatus.DOWNLOAD_VERIFIED}),
+    FileStatus.PARSE_FAILED: frozenset({FileStatus.DOWNLOAD_VERIFIED}),
+    FileStatus.DETECTION_FAILED: frozenset({FileStatus.DOWNLOAD_VERIFIED}),
+    FileStatus.WRITE_FAILED: frozenset({FileStatus.DOWNLOAD_VERIFIED}),
+    FileStatus.VERIFICATION_FAILED: frozenset({FileStatus.DOWNLOAD_VERIFIED}),
     FileStatus.CLEANUP_FAILED: frozenset({FileStatus.RAW_CLEANUP}),
 }
 
@@ -178,13 +186,17 @@ class SourceFile:
                 f"Only failed files can be retried, got {self.status.value}."
             )
 
-        # Re-queue the file at the earliest sensible pipeline step.
+        # Re-queue the file where the orchestrator picks work up again.
+        # Download-stage failures restart from the queue; everything after
+        # download re-enters the parse pool (matching restart recovery), so
+        # a retried file is genuinely reprocessed by process().
         retry_from = {
             FileStatus.DOWNLOAD_FAILED: FileStatus.DOWNLOAD_QUEUED,
-            FileStatus.DETECTION_FAILED: FileStatus.DETECTING,
-            FileStatus.PARSE_FAILED: FileStatus.PARSING,
-            FileStatus.WRITE_FAILED: FileStatus.PARQUET_WRITING,
-            FileStatus.VERIFICATION_FAILED: FileStatus.DATASET_VERIFYING,
+            FileStatus.DECOMPRESSION_FAILED: FileStatus.DOWNLOAD_VERIFIED,
+            FileStatus.DETECTION_FAILED: FileStatus.DOWNLOAD_VERIFIED,
+            FileStatus.PARSE_FAILED: FileStatus.DOWNLOAD_VERIFIED,
+            FileStatus.WRITE_FAILED: FileStatus.DOWNLOAD_VERIFIED,
+            FileStatus.VERIFICATION_FAILED: FileStatus.DOWNLOAD_VERIFIED,
             FileStatus.CLEANUP_FAILED: FileStatus.RAW_CLEANUP,
         }
         self.record_status(retry_from[self.status])

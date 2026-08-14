@@ -133,30 +133,38 @@ def retry_failed(files: dict[str, SourceFile]) -> int:
 
 
 def cleanup_stale_parts(root: str | Path) -> int:
-    """Sweep abandoned ``.part`` files left by a crash.
+    """Sweep abandoned ``.part`` / ``.decompressed`` files left by a crash.
 
     Returns how many files were removed. ``.part`` is the in-progress
     suffix for both raw downloads (``raw/*.part``) and Parquet writes
-    (``datasets/*/*.part``); neither is ever consumed directly.
+    (``datasets/*/*.part``); ``.decompressed`` is the transient expanded
+    copy for compressed raws. None of these is ever consumed directly.
     """
     root = Path(root)
     removed = 0
-    for directory in (root / "raw", root / "datasets"):
+    raw_dir = root / "raw"
+    datasets_dir = root / "datasets"
+    for directory in (raw_dir, datasets_dir):
         if not directory.exists():
             continue
-        for part in directory.glob("*.part"):
-            try:
-                part.unlink(missing_ok=True)
-                removed += 1
-            except OSError:
-                continue
+        removed += _sweep(directory.glob("*.part"))
+        if directory is raw_dir:
+            removed += _sweep(directory.glob("*.decompressed"))
         for dataset_dir in directory.iterdir():
             if not dataset_dir.is_dir():
                 continue
-            for part in dataset_dir.glob("*.part"):
-                try:
-                    part.unlink(missing_ok=True)
-                    removed += 1
-                except OSError:
-                    continue
+            removed += _sweep(dataset_dir.glob("*.part"))
+    return removed
+
+
+def _sweep(*patterns) -> int:
+    """Delete files matching the glob patterns; never raises."""
+    removed = 0
+    for pattern in patterns:
+        for path in pattern:
+            try:
+                path.unlink(missing_ok=True)
+                removed += 1
+            except OSError:
+                continue
     return removed

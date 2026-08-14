@@ -20,15 +20,17 @@ written to ``<workspace>/registry.json`` on every transition, so a crash
 mid-flight can be recovered on restart. ``recover_inflight()`` re-queues
 transient states at a safe checkpoint; ``retry_failed()`` re-queues every
 failed file; ``cleanup_stale_parts()`` sweeps abandoned ``.part`` files.
+
+Compressed raw files are expanded before parsing (Boundary 2); the
+temporary decompressed copies are tracked and removed during cleanup
+(services/orchestrator/stages.py).
 """
 
 from __future__ import annotations
 
 import json
-import os
 import threading
-from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
@@ -52,8 +54,7 @@ from services.orchestrator.registry import (
     recover_inflight,
     retry_failed,
 )
-from services.parser.parser import ParseReport, parse_file
-from services.writer.parquet_writer import verify_parquet, write_parquet
+from services.orchestrator.stages import PipelineStages, RunSummary
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,17 +86,7 @@ class PipelineSettings:
     parser_workers: int = 1
 
 
-@dataclass(slots=True)
-class RunSummary:
-    """Current work done by the last process() call."""
-    discovered: int = 0
-    downloaded: int = 0
-    parsed: int = 0
-    pending_approval: int = 0
-    failed: int = 0
-
-
-class Pipeline:
+class Pipeline(PipelineStages):
     """Coordinates mover -> detector -> parser -> writer for all files.
 
     All per-file state lives on the SourceFile objects in ``files`` keyed
@@ -119,6 +110,8 @@ class Pipeline:
         self.approved: dict[str, ApprovedConfig] = {}
         self.datasets: dict[str, DatasetMetadata] = {}
         self._detector = Detector(settings.fixed_width_layout)
+        # Track per-file decompressed temp files so cleanup removes them.
+        self._decompressed: dict[str, Path] = {}
         self._lock = threading.RLock()
         self._registry = RegistryStore(self.workspace.root)
 
@@ -261,121 +254,6 @@ class Pipeline:
             summary.failed = sum(file.is_failure() for file in self.files.values())
         return summary
 
-    def _cleanup_pool(self, files: list[SourceFile]) -> None:
-        """Finish raw deletion for files recovered mid-cleanup (single thread)."""
-        for source in files:
-            self._cleanup_raw(source)
-
-    def _download_pool(self, files: list[SourceFile], summary: RunSummary) -> None:
-        if not files:
-            return
-        with ThreadPoolExecutor(max_workers=self.settings.download_workers) as pool:
-            futures = [pool.submit(self._download_one, file, summary) for file in files]
-            for future in futures:
-                future.result()
-
-    def _parse_pool(self, files: list[SourceFile], summary: RunSummary) -> None:
-        if not files:
-            return
-        with ThreadPoolExecutor(max_workers=self.settings.parser_workers) as pool:
-            futures = [pool.submit(self._parse_one, file, summary) for file in files]
-            for future in futures:
-                future.result()
-
-    # ==================================================================
-    # Stage implementations.
-    # ==================================================================
-    def _download_one(self, source: SourceFile, summary: RunSummary) -> None:
-        self._transition(source, FileStatus.DOWNLOADING)
-        mover = self._new_mover(self.settings, self.workspace)
-        result = mover.download_file(source)
-        if not result.success:
-            self._transition(source, FileStatus.DOWNLOAD_FAILED, error=result.message)
-            return
-        source.local_path = result.local_path
-        self._transition(source, FileStatus.DOWNLOAD_VERIFIED)
-        summary.downloaded += 1
-
-    def _parse_one(self, source: SourceFile, summary: RunSummary) -> None:
-        self._transition(source, FileStatus.DETECTING)
-        try:
-            result = self._detector.detect(source.local_path)
-        except Exception as exc:  # unreadable file -> permanent detection failure
-            self._transition(source, FileStatus.DETECTION_FAILED, error=str(exc))
-            return
-
-        config = self._auto_config(source, result)
-        if config is None:
-            self._transition(source, FileStatus.AWAITING_APPROVAL)
-            return
-
-        self.approved[source.file_id] = config
-        self._transition(source, FileStatus.PARSING)
-        self._parse_and_write(source, config)
-        summary.parsed += 1
-
-    def _parse_and_write(
-        self, source: SourceFile, config: ApprovedConfig
-    ) -> None:
-        try:
-            frame, report = parse_file(source.local_path, config)
-        except Exception as exc:
-            self._transition(source, FileStatus.PARSE_FAILED, error=str(exc))
-            return
-
-        self._transition(source, FileStatus.PARQUET_WRITING)
-        dataset = self._new_dataset(source, config)
-        try:
-            parquet_path = self._dataset_parquet(dataset, config)
-            write_result = write_parquet(
-                frame,
-                parquet_path,
-                source_path=str(source.local_path),
-                schema_overrides=config.schema_overrides,
-            )
-        except Exception as exc:
-            self._transition(source, FileStatus.WRITE_FAILED, error=str(exc))
-            return
-
-        self._transition(source, FileStatus.DATASET_VERIFYING)
-        try:
-            verify = verify_parquet(
-                parquet_path,
-                expected_rows=frame.height,
-                expected_columns=list(frame.columns),
-            )
-            if not (verify["rows_matched"] and verify["columns_matched"]):
-                raise RuntimeError("written parquet does not match the parsed frame")
-        except Exception as exc:
-            self._transition(source, FileStatus.VERIFICATION_FAILED, error=str(exc))
-            return
-
-        dataset.row_count = verify["rows"]
-        dataset.schema = {
-            name: str(dtype) for name, dtype in frame.schema.items()
-        }
-        dataset.extra["parse_report"] = report.to_json_dict()
-        dataset.mark_verifying()
-        dataset.mark_complete()
-        self.datasets[dataset.dataset_id] = dataset
-        self.save_metadata(dataset)
-
-        self._transition(source, FileStatus.COMPLETE)
-        self._cleanup_raw(source)
-
-    def _cleanup_raw(self, source: SourceFile) -> None:
-        """Delete the raw file after verification; recovered files are already
-        in RAW_CLEANUP, so only transition when coming from a completed write."""
-        if source.status is not FileStatus.RAW_CLEANUP:
-            self._transition(source, FileStatus.RAW_CLEANUP)
-        mover = self._new_mover(self.settings, self.workspace)
-        if mover.cleanup_raw_file(source):
-            self._transition(source, FileStatus.RAW_DELETED)
-        else:
-            self._transition(
-                source, FileStatus.CLEANUP_FAILED, error="raw file not removable"
-            )
-
     # ==================================================================
     # Detection -> approval / configuration.
     # ==================================================================
@@ -472,7 +350,12 @@ class Pipeline:
         if config is None:
             self._transition(source, FileStatus.PARSE_FAILED, error="no approved config")
             return
-        self._parse_and_write(source, config)
+        try:
+            parse_path = self._prepare_input(source)
+        except Exception as exc:
+            self._transition(source, FileStatus.DECOMPRESSION_FAILED, error=str(exc))
+            return
+        self._parse_and_write(source, config, parse_path)
 
     # ==================================================================
     # Small helpers. -----------------------------------------------------

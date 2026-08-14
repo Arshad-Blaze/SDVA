@@ -1,5 +1,4 @@
 import json
-import shutil
 
 import polars as pl
 
@@ -10,7 +9,7 @@ from models.detection_models import (
     FileFormat,
     FixedWidthLayout,
 )
-from models.file_models import FileStatus, SourceFile
+from models.file_models import FileStatus
 from services.mft.transport import LocalTransport
 from services.orchestrator.orchestrator import (
     Pipeline,
@@ -319,22 +318,9 @@ def test_fixed_width_with_layout_auto_parses(tmp_path):
 
 # ---------------------------------------------------------------------
 # Phase 9: registry persistence + restart recovery.
+# (Recovery + retry specifics live in test_registry_recovery.py so this
+# file stays under the 500-line project limit.)
 # ---------------------------------------------------------------------
-def seed_registry(workspace: Workspace, sources: list[SourceFile]) -> None:
-    """Write a registry.json keyed by file_id directly (crash simulation)."""
-    payload = {
-        "version": 1,
-        "files": {source.file_id: source.to_json_dict() for source in sources},
-        "approved": {},
-    }
-    path = workspace.root / "registry.json"
-    path.write_text(json.dumps(payload), encoding="utf-8")
-
-
-def seeded_source(name, status) -> SourceFile:
-    return SourceFile(name=name, remote_path=f"/{name}", status=status)
-
-
 def test_registry_written_on_every_transition(tmp_path):
     pipeline = make_pipeline(tmp_path, {"sales.csv": "A,B\n1,2\n"})
     pipeline.discover()
@@ -363,172 +349,3 @@ def test_restart_recovery_restores_registry(tmp_path):
     before = restarted.discover_count()
     restarted.discover()
     assert restarted.discover_count() == before
-
-
-def test_recover_inflight_requeues_transient_states(tmp_path):
-    workspace = Workspace.at(tmp_path / "workspace").ensure()
-    seed_registry(
-        workspace,
-        [
-            seeded_source("downloading.csv", FileStatus.DOWNLOADING),
-            seeded_source("detecting.csv", FileStatus.DETECTING),
-            seeded_source("parsing.csv", FileStatus.PARSING),
-            seeded_source("waiting.csv", FileStatus.AWAITING_APPROVAL),
-            seeded_source("failed.csv", FileStatus.DOWNLOAD_FAILED),
-            seeded_source("finished.csv", FileStatus.RAW_DELETED),
-        ],
-    )
-    mft = tmp_path / "mft"
-    mft.mkdir(exist_ok=True)
-    pipeline = Pipeline(
-        workspace,
-        PipelineSettings(
-            source_path="/",
-            transport_factory=lambda: LocalTransport(mft),
-        ),
-    )
-    assert status_of(pipeline, "downloading.csv") is FileStatus.DOWNLOAD_QUEUED
-    assert status_of(pipeline, "detecting.csv") is FileStatus.DOWNLOAD_VERIFIED
-    assert status_of(pipeline, "parsing.csv") is FileStatus.DOWNLOAD_VERIFIED
-    # Stable states are left untouched.
-    assert status_of(pipeline, "waiting.csv") is FileStatus.AWAITING_APPROVAL
-    assert status_of(pipeline, "failed.csv") is FileStatus.DOWNLOAD_FAILED
-    assert status_of(pipeline, "finished.csv") is FileStatus.RAW_DELETED
-
-
-def test_process_finishes_recovered_raw_cleanup(tmp_path):
-    workspace = Workspace.at(tmp_path / "workspace").ensure()
-    (workspace.raw_dir / "leftover.csv").write_text("raw", encoding="utf-8")
-    source = seeded_source("leftover.csv", FileStatus.RAW_CLEANUP)
-    source.local_path = workspace.raw_dir / "leftover.csv"
-    seed_registry(workspace, [source])
-
-    mft = tmp_path / "mft"
-    mft.mkdir(exist_ok=True)
-    pipeline = Pipeline(
-        workspace,
-        PipelineSettings(
-            source_path="/",
-            transport_factory=lambda: LocalTransport(mft),
-        ),
-    )
-    assert status_of(pipeline, "leftover.csv") is FileStatus.RAW_CLEANUP
-    pipeline.process()
-    assert status_of(pipeline, "leftover.csv") is FileStatus.RAW_DELETED
-    assert not (workspace.raw_dir / "leftover.csv").exists()
-
-
-def test_retry_failed_requeues_all_failures(tmp_path):
-    workspace = Workspace.at(tmp_path / "workspace").ensure()
-    seed_registry(
-        workspace,
-        [
-            seeded_source("a.csv", FileStatus.DOWNLOAD_FAILED),
-            seeded_source("b.csv", FileStatus.PARSE_FAILED),
-            seeded_source("c.csv", FileStatus.AWAITING_APPROVAL),
-        ],
-    )
-    mft = tmp_path / "mft"
-    mft.mkdir(exist_ok=True)
-    pipeline = Pipeline(
-        workspace,
-        PipelineSettings(
-            source_path="/",
-            transport_factory=lambda: LocalTransport(mft),
-        ),
-    )
-    assert pipeline.retry_failed() == 2
-    assert status_of(pipeline, "a.csv") is FileStatus.DOWNLOAD_QUEUED
-    assert status_of(pipeline, "b.csv") is FileStatus.PARSING
-    assert status_of(pipeline, "c.csv") is FileStatus.AWAITING_APPROVAL
-
-
-def test_retry_file_requeues_one_and_persists(tmp_path):
-    workspace = Workspace.at(tmp_path / "workspace").ensure()
-    seed_registry(
-        workspace,
-        [seeded_source("a.csv", FileStatus.DOWNLOAD_FAILED)],
-    )
-    mft = tmp_path / "mft"
-    mft.mkdir(exist_ok=True)
-    pipeline = Pipeline(
-        workspace,
-        PipelineSettings(
-            source_path="/",
-            transport_factory=lambda: LocalTransport(mft),
-        ),
-    )
-    file_id = next(iter(pipeline.files))
-    pipeline.retry_file(file_id)
-    assert status_of(pipeline, "a.csv") is FileStatus.DOWNLOAD_QUEUED
-
-    # The re-queued status survives a restart from the persisted registry.
-    restarted = Pipeline(
-        workspace,
-        PipelineSettings(
-            source_path="/",
-            transport_factory=lambda: LocalTransport(mft),
-        ),
-    )
-    assert status_of(restarted, "a.csv") is FileStatus.DOWNLOAD_QUEUED
-
-
-def test_retry_file_rejects_non_failed(tmp_path):
-    workspace = Workspace.at(tmp_path / "workspace").ensure()
-    seed_registry(
-        workspace,
-        [seeded_source("ok.csv", FileStatus.AWAITING_APPROVAL)],
-    )
-    mft = tmp_path / "mft"
-    mft.mkdir(exist_ok=True)
-    pipeline = Pipeline(
-        workspace,
-        PipelineSettings(
-            source_path="/",
-            transport_factory=lambda: LocalTransport(mft),
-        ),
-    )
-    import pytest
-
-    with pytest.raises(ValueError, match="Only failed files"):
-        pipeline.retry_file(next(iter(pipeline.files)))
-
-
-def test_cleanup_stale_parts_sweeps_orphans(tmp_path):
-    workspace = Workspace.at(tmp_path / "workspace").ensure()
-    (workspace.raw_dir / "half.csv.part").write_text("x", encoding="utf-8")
-    (workspace.raw_dir / "ready.csv").write_text("x", encoding="utf-8")
-    dataset_dir = workspace.datasets_dir / "abc123"
-    dataset_dir.mkdir()
-    (dataset_dir / "sales.csv.parquet.part").write_text("x", encoding="utf-8")
-    (dataset_dir / "sales.csv.parquet").write_text("x", encoding="utf-8")
-
-    mft = tmp_path / "mft"
-    mft.mkdir(exist_ok=True)
-    pipeline = Pipeline(
-        workspace,
-        PipelineSettings(
-            source_path="/",
-            transport_factory=lambda: LocalTransport(mft),
-        ),
-    )
-    assert pipeline.cleanup_stale_parts() == 2
-    assert not (workspace.raw_dir / "half.csv.part").exists()
-    assert not (dataset_dir / "sales.csv.parquet.part").exists()
-    assert (workspace.raw_dir / "ready.csv").exists()
-    assert (dataset_dir / "sales.csv.parquet").exists()
-
-
-def test_corrupt_registry_does_not_block_startup(tmp_path):
-    workspace = Workspace.at(tmp_path / "workspace").ensure()
-    (workspace.root / "registry.json").write_text("{not json", encoding="utf-8")
-    mft = tmp_path / "mft"
-    mft.mkdir(exist_ok=True)
-    pipeline = Pipeline(
-        workspace,
-        PipelineSettings(
-            source_path="/",
-            transport_factory=lambda: LocalTransport(mft),
-        ),
-    )
-    assert pipeline.files == {}

@@ -42,6 +42,7 @@ def walk_to(file: SourceFile, target: FileStatus) -> None:
 # then applying the failing transition.
 FAILURE_PREDECESSOR = {
     FileStatus.DOWNLOAD_FAILED: FileStatus.DOWNLOADING,
+    FileStatus.DECOMPRESSION_FAILED: FileStatus.PARSING,
     FileStatus.DETECTION_FAILED: FileStatus.DETECTING,
     FileStatus.PARSE_FAILED: FileStatus.PARSING,
     FileStatus.WRITE_FAILED: FileStatus.PARQUET_WRITING,
@@ -111,10 +112,11 @@ def test_failure_states_are_terminal_and_flagged():
     "failed_state, retry_state",
     [
         (FileStatus.DOWNLOAD_FAILED, FileStatus.DOWNLOAD_QUEUED),
-        (FileStatus.DETECTION_FAILED, FileStatus.DETECTING),
-        (FileStatus.PARSE_FAILED, FileStatus.PARSING),
-        (FileStatus.WRITE_FAILED, FileStatus.PARQUET_WRITING),
-        (FileStatus.VERIFICATION_FAILED, FileStatus.DATASET_VERIFYING),
+        (FileStatus.DECOMPRESSION_FAILED, FileStatus.DOWNLOAD_VERIFIED),
+        (FileStatus.DETECTION_FAILED, FileStatus.DOWNLOAD_VERIFIED),
+        (FileStatus.PARSE_FAILED, FileStatus.DOWNLOAD_VERIFIED),
+        (FileStatus.WRITE_FAILED, FileStatus.DOWNLOAD_VERIFIED),
+        (FileStatus.VERIFICATION_FAILED, FileStatus.DOWNLOAD_VERIFIED),
         (FileStatus.CLEANUP_FAILED, FileStatus.RAW_CLEANUP),
     ],
 )

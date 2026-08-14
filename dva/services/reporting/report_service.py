@@ -8,6 +8,7 @@ formats) and reproduces the artifacts of the reference engine's
   {prefix}_test_summary.parquet  per-UPC|DESC totals for TEST
   {prefix}_comparison.parquet    joined detail with "Present In"
   {prefix}_summary.parquet       Present-In groups + Grand Total
+  {prefix}.xlsx                  the four tables in one workbook
 
 plus in-memory metrics and top/bottom-5 frames for the UI. All reads are
 lazy (``pl.scan_parquet``); report-sized aggregates are streamed to disk
@@ -286,6 +287,21 @@ def _build_metrics(
     return metrics, top_5_sales, bottom_5_sales, top_5_units, bottom_5_units
 
 
+def _write_excel(
+    path: Path, sheets: dict[str, pl.LazyFrame]
+) -> None:
+    """Stream one .xlsx workbook from lazy frames (bounded memory)."""
+    from openpyxl import Workbook
+
+    workbook = Workbook(write_only=True)
+    for name, lf in sheets.items():
+        worksheet = workbook.create_sheet(title=name)
+        worksheet.append(lf.collect_schema().names())
+        for row in lf.collect(engine="streaming").iter_rows():
+            worksheet.append(list(row))
+    workbook.save(path)
+
+
 def generate_reports(
     bau_path: str | Path,
     test_path: str | Path,
@@ -316,11 +332,21 @@ def generate_reports(
         "test_summary": output_dir / f"{prefix}_test_summary.parquet",
         "comparison": output_dir / f"{prefix}_comparison.parquet",
         "summary": output_dir / f"{prefix}_summary.parquet",
+        "excel": output_dir / f"{prefix}.xlsx",
     }
     bau_lf.sink_parquet(artifacts["bau_summary"])
     test_lf.sink_parquet(artifacts["test_summary"])
     comparison.sink_parquet(artifacts["comparison"])
     summary.sink_parquet(artifacts["summary"])
+    _write_excel(
+        artifacts["excel"],
+        {
+            "BAU Summary": bau_lf,
+            "TEST Summary": test_lf,
+            "Comparison": comparison,
+            "Summary": summary,
+        },
+    )
 
     metrics, top_5_sales, bottom_5_sales, top_5_units, bottom_5_units = _build_metrics(
         comparison

@@ -234,9 +234,19 @@ def test_artifacts_are_readable_parquet(tmp_path):
         "test_summary",
         "comparison",
         "summary",
+        "excel",
     }
     for artifact in result.artifacts.values():
         assert artifact.exists()
+        if artifact.suffix == ".xlsx":
+            from openpyxl import load_workbook
+
+            workbook = load_workbook(artifact, read_only=True)
+            assert workbook.sheetnames == ["BAU Summary", "TEST Summary", "Comparison", "Summary"]
+            # the comparison sheet has its header plus all comparison rows
+            headers = next(workbook["Comparison"].iter_rows(values_only=True))
+            assert "Present In" in headers
+            continue
         df = pl.read_parquet(artifact)
         assert df.height >= 1
     assert result.elapsed_seconds >= 0.0
